@@ -24,7 +24,43 @@ ERROR_THRESHOLD = 0.01
 
 
 class Worker(threading.Thread):
-    pass
+
+    def __init__(self, queue, counters, addr, dry):
+        super().__init__(daemon=True)
+        self._queue = queue
+        self.counters = counters
+        self.addr = addr
+        self.dry = dry
+        self.all = 0
+        self.errors = 0
+
+    def run(self):
+        conn = memcache.Client((self.addr, ))
+
+        while True:
+            try:
+                task = self._queue.get()
+            except queue.Empty:
+                continue
+            if task == SENTINEL:
+                self.counters.put((self.all, self.errors))
+                self._queue.task_done()
+                logging.info('{} - {}: total processed {} with errors {}'.format(
+                    mp.current_process().name,
+                    threading.current_thread().name,
+                    self.all,
+                    self.errors
+                ))
+                break
+            else:
+                self.all += 1
+                apps = parse_appsinstalled(task)
+                if not apps:
+                    self.errors += 1
+                    continue
+                if not insert_appsinstalled(conn, apps, self.dry):
+                    self.errors += 1
+                self._queue.task_done()
 
 
 def dot_rename(path):
@@ -88,7 +124,7 @@ def main(options):
     proc_pool = mp.Pool(options.workers)
     for path in proc_pool.imap(dispatcher, args):
         dot_rename(path)
-        logging.info('File is renamed to {}'.format(path))
+        logging.info('File was renamed to {}'.format(path))
 
 
 def dispatcher(args):
