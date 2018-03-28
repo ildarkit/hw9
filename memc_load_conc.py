@@ -39,7 +39,7 @@ class Worker(threading.Thread):
 
         while True:
             try:
-                task = self._queue.get()
+                task = self._queue.get_nowait()
             except queue.Empty:
                 continue
             if task == SENTINEL:
