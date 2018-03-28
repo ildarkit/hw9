@@ -18,8 +18,9 @@ import memcache
 # pip install protobuf
 import appsinstalled_pb2
 
-NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
+SENTINEL = object()
+ERROR_THRESHOLD = 0.01
 
 
 class Worker(threading.Thread):
@@ -79,7 +80,71 @@ def main(options):
         "adid": options.adid,
         "dvid": options.dvid,
     }
-    pass
+    args = []
+    for path in glob.iglob(options.pattern):
+        args.append((path, device_memc, options.dry))
+    args = sorted(args, key=lambda arg: arg[0])
+
+    proc_pool = mp.Pool(options.workers)
+    for path in proc_pool.imap(dispatcher, args):
+        dot_rename(path)
+        logging.info('File is renamed to {}'.format(path))
+
+
+def dispatcher(args):
+    path, devices, dry = args
+    workers = []
+    _queue = {}
+    counters = queue.Queue()
+
+    for dev_type, addr in devices.items():
+        _queue[dev_type] = queue.Queue()
+        worker = Worker(_queue, counters, addr, dry)
+        workers.append(worker)
+
+    for worker in workers:
+        worker.start()
+
+    processed = put_to_queue(path, devices, _queue)
+
+    for dev_type in devices:
+        _queue[dev_type].put(SENTINEL)
+
+    for worker in workers:
+        worker.join()
+
+    _all = errors = 0
+    while not counters.empty():
+        result = counters.get()
+        _all += result[0]
+        errors += result[1]
+
+    if processed.all or _all:
+        error_ratio = processed.errors + errors / processed.all + _all
+        if error_ratio > ERROR_THRESHOLD:
+            logging.info("Many errors occurred: {} > {}".format(error_ratio, ERROR_THRESHOLD))
+
+    return path
+
+
+def put_to_queue(path, devices, _queue):
+    _all = 0
+    errors = 0
+    logging.info('Process file {}'.format(path))
+    with gzip.open(path, mode="rt") as tracker_log:
+        for line in tracker_log:
+            if not line:
+                continue
+            line = line.strip()
+            _all += 1
+            dev_type = line.split(maxsplit=1)[0]
+            if dev_type not in devices:
+                errors += 1
+                logging.error("Unknown device type: {}".format(dev_type))
+                continue
+            _queue[dev_type].put(line)
+
+    return collections.namedtuple('Counters', ('all', 'errors'))(_all, errors)
 
 
 def prototest():
@@ -108,7 +173,7 @@ if __name__ == '__main__':
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
-    op.add_option("-w", "--workers", action="store", default=4)
+    op.add_option("-w", "--workers", action="store", default=4, type="int")
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
