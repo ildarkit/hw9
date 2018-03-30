@@ -25,17 +25,17 @@ ERROR_THRESHOLD = 0.01
 
 class Worker(threading.Thread):
 
-    def __init__(self, queue, counters, addr, dry):
+    def __init__(self, queue, counters, addr, dry_run=False):
         super().__init__(daemon=True)
         self._queue = queue
         self.counters = counters
         self.addr = addr
-        self.dry = dry
+        self.dry_run = dry_run
         self.all = 0
         self.errors = 0
+        self.conn = memcache.Client((self.addr,))
 
     def run(self):
-        conn = memcache.Client((self.addr, ))
 
         while True:
             try:
@@ -54,59 +54,56 @@ class Worker(threading.Thread):
                 break
             else:
                 self.all += 1
-                apps = parse_appsinstalled(task)
+                apps = self.parse_appsinstalled(task)
                 if not apps:
                     self.errors += 1
                     continue
-                if not insert_appsinstalled(conn, apps, self.dry):
+                if not self.insert_appsinstalled(apps):
                     self.errors += 1
                 self._queue.task_done()
+
+    def insert_appsinstalled(self, appsinstalled):
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+        packed = ua.SerializeToString()
+        # @TODO persistent connection
+        # @TODO retry and timeouts!
+        try:
+            if self.dry_run:
+                logging.debug("{} - {} -> {}".format(self.addr, key, str(ua).replace("\n", " ")))
+            else:
+                self.conn.set(key, packed)
+        except Exception as e:
+            logging.exception("Cannot write to memc {}: {}".format(self.addr, e))
+            return False
+        return True
+
+    def parse_appsinstalled(self, line):
+        line_parts = line.strip().split("\t")
+        if len(line_parts) < 5:
+            return
+        dev_type, dev_id, lat, lon, raw_apps = line_parts
+        if not dev_type or not dev_id:
+            return
+        try:
+            apps = [int(a.strip()) for a in raw_apps.split(",")]
+        except ValueError:
+            apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
+            logging.info("Not all user apps are digits: `{}`".format(line))
+        try:
+            lat, lon = float(lat), float(lon)
+        except ValueError:
+            logging.info("Invalid geo coords: `{}`".format(line))
+        return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
 def dot_rename(path):
     head, fn = os.path.split(path)
     # atomic in most cases
     os.rename(path, os.path.join(head, "." + fn))
-
-
-def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
-    try:
-        if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-        else:
-            memc = memcache.Client([memc_addr])
-            memc.set(key, packed)
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-    return True
-
-
-def parse_appsinstalled(line):
-    line_parts = line.strip().split("\t")
-    if len(line_parts) < 5:
-        return
-    dev_type, dev_id, lat, lon, raw_apps = line_parts
-    if not dev_type or not dev_id:
-        return
-    try:
-        apps = [int(a.strip()) for a in raw_apps.split(",")]
-    except ValueError:
-        apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
-        logging.info("Not all user apps are digits: `%s`" % line)
-    try:
-        lat, lon = float(lat), float(lon)
-    except ValueError:
-        logging.info("Invalid geo coords: `%s`" % line)
-    return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
 def main(options):
@@ -217,9 +214,9 @@ if __name__ == '__main__':
         prototest()
         sys.exit(0)
 
-    logging.info("Memc loader started with options: %s" % opts)
+    logging.info("Memc loader started with options: {}".format(opts))
     try:
         main(opts)
     except Exception as e:
-        logging.exception("Unexpected error: %s" % e)
+        logging.exception("Unexpected error: {}".format(e))
         sys.exit(1)
