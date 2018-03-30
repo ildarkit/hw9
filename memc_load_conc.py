@@ -63,20 +63,6 @@ class Worker(threading.Thread):
                     self.errors += 1
                 self._queue.task_done()
 
-    def insert_appsinstalled(self, appsinstalled):
-        ua = appsinstalled_pb2.UserApps()
-        ua.lat = appsinstalled.lat
-        ua.lon = appsinstalled.lon
-        key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
-        ua.apps.extend(appsinstalled.apps)
-
-        if self.dry_run:
-            logging.debug("{} - {} -> {}".format(self.addr, key, str(ua).replace("\n", " ")))
-        else:
-            packed = ua.SerializeToString()
-            return self.memc_write(key, packed)
-        return True
-
     def memc_write(self, key, packed):
         counter = self.attempts if self.attempts > 0 else 1
         result = False
@@ -99,6 +85,20 @@ class Worker(threading.Thread):
 
         return result
 
+    def insert_appsinstalled(self, appsinstalled):
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+
+        if self.dry_run:
+            logging.debug("{} - {} -> {}".format(self.addr, key, str(ua).replace("\n", " ")))
+        else:
+            packed = ua.SerializeToString()
+            return self.memc_write(key, packed)
+        return True
+
     def parse_appsinstalled(self, line):
         line_parts = line.strip().split("\t")
         if len(line_parts) < 5:
@@ -118,28 +118,24 @@ class Worker(threading.Thread):
         return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
-def dot_rename(path):
-    head, fn = os.path.split(path)
-    # atomic in most cases
-    os.rename(path, os.path.join(head, "." + fn))
+def put_to_queue(path, devices, _queue):
+    _all = 0
+    errors = 0
+    logging.info('Process file {}'.format(path))
+    with gzip.open(path, mode="rt") as tracker_log:
+        for line in tracker_log:
+            if not line:
+                continue
+            line = line.strip()
+            _all += 1
+            dev_type = line.split(maxsplit=1)[0]
+            if dev_type not in devices:
+                errors += 1
+                logging.error("Unknown device type: {}".format(dev_type))
+                continue
+            _queue[dev_type].put(line)
 
-
-def main(options):
-    device_memc = {
-        "idfa": options.idfa,
-        "gaid": options.gaid,
-        "adid": options.adid,
-        "dvid": options.dvid,
-    }
-    args = []
-    for path in glob.iglob(options.pattern):
-        args.append((path, device_memc, options.dry))
-    args = sorted(args, key=lambda arg: arg[0])
-
-    proc_pool = mp.Pool(options.workers)
-    for path in proc_pool.imap(dispatcher, args):
-        dot_rename(path)
-        logging.info('File was renamed to {}'.format(path))
+    return collections.namedtuple('Counters', ('all', 'errors'))(_all, errors)
 
 
 def dispatcher(args):
@@ -178,24 +174,28 @@ def dispatcher(args):
     return path
 
 
-def put_to_queue(path, devices, _queue):
-    _all = 0
-    errors = 0
-    logging.info('Process file {}'.format(path))
-    with gzip.open(path, mode="rt") as tracker_log:
-        for line in tracker_log:
-            if not line:
-                continue
-            line = line.strip()
-            _all += 1
-            dev_type = line.split(maxsplit=1)[0]
-            if dev_type not in devices:
-                errors += 1
-                logging.error("Unknown device type: {}".format(dev_type))
-                continue
-            _queue[dev_type].put(line)
+def dot_rename(path):
+    head, fn = os.path.split(path)
+    # atomic in most cases
+    os.rename(path, os.path.join(head, "." + fn))
 
-    return collections.namedtuple('Counters', ('all', 'errors'))(_all, errors)
+
+def main(options):
+    device_memc = {
+        "idfa": options.idfa,
+        "gaid": options.gaid,
+        "adid": options.adid,
+        "dvid": options.dvid,
+    }
+    args = []
+    for path in glob.iglob(options.pattern):
+        args.append((path, device_memc, options.dry))
+    args = sorted(args, key=lambda arg: arg[0])
+
+    proc_pool = mp.Pool(options.workers)
+    for path in proc_pool.imap(dispatcher, args):
+        dot_rename(path)
+        logging.info('File was renamed to {}'.format(path))
 
 
 def prototest():
