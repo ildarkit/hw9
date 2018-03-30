@@ -146,7 +146,7 @@ def dispatcher(args):
 
     for dev_type, addr in devices.items():
         _queue[dev_type] = queue.Queue()
-        worker = Worker(_queue, counters, addr, dry)
+        worker = Worker(_queue[dev_type], counters, addr, dry)
         workers.append(worker)
 
     for worker in workers:
