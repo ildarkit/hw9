@@ -74,10 +74,10 @@ class Worker(threading.Thread):
             logging.debug("{} - {} -> {}".format(self.addr, key, str(ua).replace("\n", " ")))
         else:
             packed = ua.SerializeToString()
-            return self.try_set_memc(key, packed)
+            return self.memc_write(key, packed)
         return True
 
-    def try_set_memc(self, key, packed):
+    def memc_write(self, key, packed):
         i = self.attempts if self.attempts > 0 else 1
         result = False
 
@@ -85,12 +85,18 @@ class Worker(threading.Thread):
             if self.attempts > 0:
                 if i > 0:
                     i -= 1
-
-            if self.memc_client.set(key, packed):
-                result = True
+            try:
+                result = self.memc_client.set(key, packed)
+            except Exception as err:
+                logging.exception(
+                    "An unexpected error occurred while writing to memc {}: {}".format(self.addr, err)
+                )
+                break
+            if result:
                 break
             elif i == 0:
-                logging.exception("Cannot write to memc {}: {}".format(self.addr, err))
+                result = False
+                logging.error("Cannot write to memc {}".format(self.addr))
                 break
 
         return result
