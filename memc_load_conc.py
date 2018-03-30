@@ -25,7 +25,7 @@ ERROR_THRESHOLD = 0.01
 
 class Worker(threading.Thread):
 
-    def __init__(self, queue, counters, addr, dry_run=False):
+    def __init__(self, queue, counters, addr, dry_run=False, attempts=0, socket_timeout=2):
         super().__init__(daemon=True)
         self._queue = queue
         self.counters = counters
@@ -33,7 +33,8 @@ class Worker(threading.Thread):
         self.dry_run = dry_run
         self.all = 0
         self.errors = 0
-        self.conn = memcache.Client((self.addr,))
+        self.attempts = attempts
+        self.memc_client = memcache.Client((self.addr,), socket_timeout=socket_timeout)
 
     def run(self):
 
@@ -68,18 +69,31 @@ class Worker(threading.Thread):
         ua.lon = appsinstalled.lon
         key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
         ua.apps.extend(appsinstalled.apps)
-        packed = ua.SerializeToString()
-        # @TODO persistent connection
-        # @TODO retry and timeouts!
-        try:
-            if self.dry_run:
-                logging.debug("{} - {} -> {}".format(self.addr, key, str(ua).replace("\n", " ")))
-            else:
-                self.conn.set(key, packed)
-        except Exception as e:
-            logging.exception("Cannot write to memc {}: {}".format(self.addr, e))
-            return False
+
+        if self.dry_run:
+            logging.debug("{} - {} -> {}".format(self.addr, key, str(ua).replace("\n", " ")))
+        else:
+            packed = ua.SerializeToString()
+            return self.try_set_memc(key, packed)
         return True
+
+    def try_set_memc(self, key, packed):
+        i = self.attempts if self.attempts > 0 else 1
+        result = False
+
+        while True:
+            if self.attempts > 0:
+                if i > 0:
+                    i -= 1
+
+            if self.memc_client.set(key, packed):
+                result = True
+                break
+            elif i == 0:
+                logging.exception("Cannot write to memc {}: {}".format(self.addr, err))
+                break
+
+        return result
 
     def parse_appsinstalled(self, line):
         line_parts = line.strip().split("\t")
