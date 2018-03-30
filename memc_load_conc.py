@@ -78,13 +78,12 @@ class Worker(threading.Thread):
         return True
 
     def memc_write(self, key, packed):
-        i = self.attempts if self.attempts > 0 else 1
+        counter = self.attempts if self.attempts > 0 else 1
         result = False
 
-        while True:
-            if self.attempts > 0:
-                if i > 0:
-                    i -= 1
+        while counter:
+            if self.attempts > 0 and counter > 0:
+                counter -= 1
             try:
                 result = self.memc_client.set(key, packed)
             except Exception as err:
@@ -94,10 +93,9 @@ class Worker(threading.Thread):
                 break
             if result:
                 break
-            elif i == 0:
+            elif counter == 0:
                 result = False
                 logging.error("Cannot write to memc {}".format(self.addr))
-                break
 
         return result
 
