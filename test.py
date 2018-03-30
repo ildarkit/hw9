@@ -32,9 +32,9 @@ class WorkerTestCase(unittest.TestCase):
         cls.worker = Worker(_queue, counters, opts.idfa, attempts=2)
 
     @cases((
-            'idfa e7e1a50c0ec2747ca56cd9e1558c0d7c 67.7835424444 -22.8044005471 7942,8519,4232,3032,4766,9283,5682,155',
-            'idfa f5ae5fe6122bb20d08ff2c2ec43fb4c4 -104.68583244 -51.24448376 4877,7862,7181,6071,2107,2826,2293,3103',
-            'idfa 3261cf44cbe6a00839c574336fdf49f6 137.790839567 56.8403675248 7462,1115,5205,6700,865,5317,4967,2104',
+            'idfa\te7e1a50c0ec2747ca56cd9e1558c0d7c\t67.7835424444\t-22.8044005471\t7942,8519,4232,3032,4766,9283,5682',
+            'idfa\tf5ae5fe6122bb20d08ff2c2ec43fb4c4\t-104.68583244\t-51.24448376\t4877,7862,7181,6071,2107,2826,2293',
+            'idfa\t3261cf44cbe6a00839c574336fdf49f6\t137.790839567\t56.8403675248\t7462,1115,5205,6700,865,5317,4967',
     ))
     def test_parse_appsinstalled(self, line):
         appsinstalled1 = self.worker.parse_appsinstalled(line)
@@ -75,9 +75,9 @@ class MemcacheTestCase(unittest.TestCase):
         cls.client = memcache.Client((opts.idfa, ), socket_timeout=2, debug=1, dead_retry=3)
 
     @cases((
-            'idfa e7e1a50c0ec2747ca56cd9e1558c0d7c 67.7835424444 -22.8044005471 7942,8519,4232,3032,4766,9283,5682,155',
-            'idfa f5ae5fe6122bb20d08ff2c2ec43fb4c4 -104.68583244 -51.24448376 4877,7862,7181,6071,2107,2826,2293,3103',
-            'idfa 3261cf44cbe6a00839c574336fdf49f6 137.790839567 56.8403675248 7462,1115,5205,6700,865,5317,4967,2104',
+            'idfa\te7e1a50c0ec2747ca56cd9e1558c0d7c\t67.7835424444\t-22.8044005471\t7942,8519,4232,3032,4766,9283,5682',
+            'idfa\tf5ae5fe6122bb20d08ff2c2ec43fb4c4\t-104.68583244\t-51.24448376\t4877,7862,7181,6071,2107,2826,2293',
+            'idfa\t3261cf44cbe6a00839c574336fdf49f6\t137.790839567\t56.8403675248\t7462,1115,5205,6700,865,5317,4967',
     ))
     def test_memc_write(self, line):
 
