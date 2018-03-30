@@ -1,0 +1,2 @@
+python-memcached==1.59
+protobuf==3.5.2.post1
