@@ -92,53 +92,84 @@ class Worker(threading.Thread):
         return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
-def get_task_for_memc(args):
-    out_queue, addr, socket_timeout, attempts, dry = args
+class MemcWorker(threading.Thread):
 
-    memc_client = memcache.Client((addr,), socket_timeout=socket_timeout)
+    def __init__(self, out_queue, counters, addr, socket_timeout, attempts, dry):
+        super().__init__()
+        self.out_queue = out_queue
+        self.counters = counters
+        self.addr = addr
+        self.attempts = attempts
+        self.dry = dry
+        self.all = 0
+        self.errors = 0
+        self.memc_client = memcache.Client((addr,), socket_timeout=socket_timeout)
+
+    def run(self):
+
+        while True:
+            try:
+                task = self.out_queue.get_nowait()
+            except queue.Empty:
+                continue
+
+            if task == SENTINEL:
+                self.counters.put((self.all, self.errors))
+                self.out_queue.task_done()
+                break
+            else:
+                self.all += 1
+                if self.dry:
+                    logging.debug("{} - {} -> {}".format(self.addr, *task))
+                elif not self.memc_write(task):
+                    self.errors += 1
+
+    def memc_write(self, task):
+        counter = self.attempts if self.attempts > 0 else 1
+        result = False
+
+        while counter:
+            if self.attempts > 0 and counter > 0:
+                counter -= 1
+            try:
+                result = self.memc_client.set(*task)
+            except Exception as err:
+                logging.exception(
+                    "An unexpected error occurred while writing to memc {}: {}".format(self.addr, err)
+                )
+                break
+            if result:
+                break
+            elif counter == 0:
+                result = False
+                logging.error("Cannot write to memc {}".format(self.addr))
+
+        return result
+
+
+def start_workers_for_memc(args, socket_timeout, attempts, dry):
+    workers = []
+    counters = queue.Queue()
+    for out_queue, addr in args:
+        worker = MemcWorker(out_queue, counters, addr, socket_timeout, attempts, dry)
+        workers.append(worker)
+
+    for worker in workers:
+        worker.start()
+
+    for worker in workers:
+        worker.join()
 
     _all = errors = 0
+    while not counters.empty():
+        result = counters.get()
+        _all += result[0]
+        errors += result[1]
 
-    while True:
-        try:
-            task = out_queue.get_nowait()
-        except queue.Empty:
-            continue
-
-        if task == SENTINEL:
-            out_queue.task_done()
-            break
-        else:
-            _all += 1
-            if dry:
-                logging.debug("{} - {} -> {}".format(addr, *task))
-            elif not memc_write(memc_client, task, addr, attempts):
-                errors += 1
-
-    return _all, errors
-
-
-def memc_write(client, task, addr, attempts):
-    counter = attempts if attempts > 0 else 1
-    result = False
-
-    while counter:
-        if attempts > 0 and counter > 0:
-            counter -= 1
-        try:
-            result = client.set(*task)
-        except Exception as err:
-            logging.exception(
-                "An unexpected error occurred while writing to memc {}: {}".format(addr, err)
-            )
-            break
-        if result:
-            break
-        elif counter == 0:
-            result = False
-            logging.error("Cannot write to memc {}".format(addr))
-
-    return result
+    if _all:
+        error_ratio = errors / _all
+        if error_ratio > ERROR_THRESHOLD:
+            logging.info("Many write errors occurred: {} > {}".format(error_ratio, ERROR_THRESHOLD))
 
 
 def put_to_queue(path, in_queue):
@@ -220,7 +251,14 @@ def main(options):
         in_queue[dev_type] = manager.Queue()
         out_queue[dev_type] = manager.Queue()
 
-        thread_args.append((out_queue[dev_type], addr, SOCKET_TIMEOUT, ATTEMPTS, options.dry))
+        thread_args.append((out_queue[dev_type], addr, ))
+
+    # в отдельном процессе запускаются треды для записи
+    # в мемкеши соответсвующих устройств device_memc
+    mp.Process(
+        target=start_workers_for_memc,
+        args=(thread_args, SOCKET_TIMEOUT, ATTEMPTS, options.dry)
+    ).start()
 
     proc_args = []
     for path in glob.iglob(options.pattern):
@@ -233,13 +271,6 @@ def main(options):
     for path in proc_pool.imap(dispatcher, proc_args):
         to = dot_rename(path)
         logging.info('File {} was renamed to {}'.format(path, to))
-
-    # пул тредов для записи в мемкеши соответсвующих устройств device_memc
-    thread_pool = ThreadPool(len(device_memc) * options.workers)
-    for counters in thread_pool.imap(get_task_for_memc, thread_args):
-        logging.info(
-            'Write statistics to {}: total processed {}, errors {}'.format(thread_args[1], *counters)
-        )
 
 
 def prototest():
@@ -263,7 +294,7 @@ if __name__ == '__main__':
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
-    op.add_option("--pattern", action="store", default=r"C:\otus_python\hw9\data\appsinstalled\*.tsv.gz")
+    op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
