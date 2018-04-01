@@ -20,7 +20,7 @@ import memcache
 import appsinstalled_pb2
 
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
-SENTINEL = object()
+SENTINEL = bytes('quit_task', encoding='utf-8')
 ERROR_THRESHOLD = 0.01
 
 SOCKET_TIMEOUT = 2
@@ -29,13 +29,15 @@ ATTEMPTS = 0
 
 class Worker(threading.Thread):
 
-    def __init__(self, in_queue, out_queue, counters):
+    def __init__(self, in_queue, out_queue, counters, tasks_size=8192):
         super().__init__(daemon=True)
         self.in_queue = in_queue
         self.out_queue = out_queue
         self.counters = counters
         self.all = 0
         self.errors = 0
+        self.tasks = {}
+        self.tasks_size = tasks_size
 
     def run(self):
 
@@ -44,6 +46,7 @@ class Worker(threading.Thread):
                 task = self.in_queue.get_nowait()
             except queue.Empty:
                 continue
+
             if task == SENTINEL:
                 self.counters.put((self.all, self.errors))
                 self.in_queue.task_done()
@@ -53,6 +56,9 @@ class Worker(threading.Thread):
                     self.all,
                     self.errors
                 ))
+                if self.tasks:
+                    self.out_queue.put(self.tasks)
+                self.out_queue.put(SENTINEL)
                 break
             else:
                 self.all += 1
@@ -60,7 +66,12 @@ class Worker(threading.Thread):
                 if not apps:
                     self.errors += 1
                     continue
-                self.out_queue.put(self.serialize(apps))
+                key, packed = self.serialize(apps)
+                self.tasks[key] = packed
+
+                if len(self.tasks) == self.tasks_size:
+                    self.out_queue.put(self.tasks)
+                    self.tasks.clear()
 
     def serialize(self, appsinstalled):
         ua = appsinstalled_pb2.UserApps()
@@ -132,7 +143,7 @@ class MemcWorker(threading.Thread):
             if self.attempts > 0 and counter > 0:
                 counter -= 1
             try:
-                result = self.memc_client.set(*task)
+                result = self.memc_client.set_multi(task)
             except Exception as err:
                 logging.exception(
                     "An unexpected error occurred while writing to memc {}: {}".format(self.addr, err)
@@ -208,7 +219,6 @@ def dispatcher(args):
 
     for dev_type in in_queue:
         in_queue[dev_type].put(SENTINEL)
-        out_queue[dev_type].put(SENTINEL)
 
     for worker in workers:
         worker.join()
@@ -294,7 +304,7 @@ if __name__ == '__main__':
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
-    op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
+    op.add_option("--pattern", action="store", default=r"C:\otus_python\hw9\data\appsinstalled\*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
