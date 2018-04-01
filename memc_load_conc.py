@@ -9,7 +9,6 @@ import logging
 import threading
 import collections
 import multiprocessing as mp
-from multiprocessing.pool import ThreadPool
 from optparse import OptionParser
 
 # pip install python-memcached
@@ -23,13 +22,10 @@ AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "
 SENTINEL = bytes('quit_task', encoding='utf-8')
 ERROR_THRESHOLD = 0.01
 
-SOCKET_TIMEOUT = 2
-ATTEMPTS = 0
-
 
 class Worker(threading.Thread):
 
-    def __init__(self, in_queue, out_queue, counters, tasks_size=8192):
+    def __init__(self, in_queue, out_queue, counters, tasks_size=1024):
         super().__init__(daemon=True)
         self.in_queue = in_queue
         self.out_queue = out_queue
@@ -105,7 +101,7 @@ class Worker(threading.Thread):
 
 class MemcWorker(threading.Thread):
 
-    def __init__(self, out_queue, counters, addr, socket_timeout, attempts, dry):
+    def __init__(self, out_queue, counters, addr, dry, socket_timeout=2, attempts=0):
         super().__init__()
         self.out_queue = out_queue
         self.counters = counters
@@ -158,12 +154,19 @@ class MemcWorker(threading.Thread):
         return result
 
 
-def start_workers_for_memc(args, socket_timeout, attempts, dry):
+def start_workers_for_memc(queues, options):
+    dry = options.dry
+    socket_timeout = options.socket_timeout
+    attempts = options.attempts
     workers = []
     counters = queue.Queue()
-    for out_queue, addr in args:
-        worker = MemcWorker(out_queue, counters, addr, socket_timeout, attempts, dry)
-        workers.append(worker)
+    for out_queue, addr in queues:
+        for _ in range(options.workers):
+            worker = MemcWorker(
+                out_queue, counters,
+                addr, dry, socket_timeout, attempts
+            )
+            workers.append(worker)
 
     for worker in workers:
         worker.start()
@@ -267,7 +270,7 @@ def main(options):
     # в мемкеши соответсвующих устройств device_memc
     mp.Process(
         target=start_workers_for_memc,
-        args=(thread_args, SOCKET_TIMEOUT, ATTEMPTS, options.dry)
+        args=(thread_args, options)
     ).start()
 
     proc_args = []
@@ -304,12 +307,14 @@ if __name__ == '__main__':
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
-    op.add_option("--pattern", action="store", default=r"C:\otus_python\hw9\data\appsinstalled\*.tsv.gz")
+    op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     op.add_option("-w", "--workers", action="store", default=4, type="int")
+    op.add_option("-s", "--socket_timeout", action="store", default=2, type="int")
+    op.add_option("-a", "--attempts", action="store", default=0, type="int")
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
