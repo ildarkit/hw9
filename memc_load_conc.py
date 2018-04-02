@@ -25,7 +25,7 @@ ERROR_THRESHOLD = 0.01
 
 class Worker(threading.Thread):
 
-    def __init__(self, in_queue, out_queue, counters, tasks_size=1024):
+    def __init__(self, in_queue, out_queue, counters, tasks_size=8192):
         super().__init__(daemon=True)
         self.in_queue = in_queue
         self.out_queue = out_queue
@@ -101,7 +101,7 @@ class Worker(threading.Thread):
 
 class MemcWorker(threading.Thread):
 
-    def __init__(self, out_queue, counters, addr, dry, socket_timeout=2, attempts=0):
+    def __init__(self, out_queue, counters, addr, dry=False, socket_timeout=2, attempts=0):
         super().__init__()
         self.out_queue = out_queue
         self.counters = counters
@@ -120,7 +120,7 @@ class MemcWorker(threading.Thread):
             except queue.Empty:
                 continue
 
-            if task == SENTINEL:
+            if task == SENTINEL or task is None:
                 self.counters.put((self.all, self.errors))
                 self.out_queue.task_done()
                 break
@@ -145,7 +145,7 @@ class MemcWorker(threading.Thread):
                     "An unexpected error occurred while writing to memc {}: {}".format(self.addr, err)
                 )
                 break
-            if result:
+            if not result:
                 break
             elif counter == 0:
                 result = False
@@ -161,14 +161,17 @@ def start_workers_for_memc(queues, options):
     workers = []
     counters = queue.Queue()
     for out_queue, addr in queues:
-        for _ in range(options.workers):
-            worker = MemcWorker(
-                out_queue, counters,
-                addr, dry, socket_timeout, attempts
-            )
-            workers.append(worker)
+        worker = MemcWorker(
+            out_queue, counters,
+            addr, dry, socket_timeout, attempts
+        )
+        workers.append(worker)
 
     for worker in workers:
+        logging.info('Worker started in the thread {} of process {}.'.format(
+            threading.current_thread().name,
+            mp.current_process().name,
+        ))
         worker.start()
 
     for worker in workers:
@@ -207,12 +210,12 @@ def put_to_queue(path, in_queue):
 
 
 def dispatcher(args):
-    path, in_queue, out_queue = args
+    path, in_queue, out_queue, task_size = args
     workers = []
     counters = queue.Queue()
 
     for dev_type, in_q in in_queue.items():
-        worker = Worker(in_q, out_queue[dev_type], counters)
+        worker = Worker(in_q, out_queue[dev_type], counters, task_size)
         workers.append(worker)
 
     for worker in workers:
@@ -266,17 +269,23 @@ def main(options):
 
         thread_args.append((out_queue[dev_type], addr, ))
 
+    proc_args = []
+    for path in glob.iglob(options.pattern):
+        proc_args.append((path, in_queue, out_queue, options.task_size))
+    proc_args = sorted(proc_args, key=lambda arg: arg[0])
+
+    if not proc_args:
+        logging.error(
+            'Nothing to upload. There is no match for the pattern {}.'.format(options.pattern)
+        )
+        return
+
     # в отдельном процессе запускаются треды для записи
     # в мемкеши соответсвующих устройств device_memc
     mp.Process(
         target=start_workers_for_memc,
         args=(thread_args, options)
     ).start()
-
-    proc_args = []
-    for path in glob.iglob(options.pattern):
-        proc_args.append((path, in_queue, out_queue))
-    proc_args = sorted(proc_args, key=lambda arg: arg[0])
 
     # пул процессов, в каждом из которых запускаются
     # len(device_memc) потоков
@@ -315,6 +324,7 @@ if __name__ == '__main__':
     op.add_option("-w", "--workers", action="store", default=4, type="int")
     op.add_option("-s", "--socket_timeout", action="store", default=2, type="int")
     op.add_option("-a", "--attempts", action="store", default=0, type="int")
+    op.add_option("-T", "--task_size", action="store", default=8192, type="int")
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
