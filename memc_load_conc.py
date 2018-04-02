@@ -19,39 +19,42 @@ import memcache
 import appsinstalled_pb2
 
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
-SENTINEL = object()
+SENTINEL = bytes('quit_task', encoding='utf-8')
 ERROR_THRESHOLD = 0.01
 
 
 class Worker(threading.Thread):
 
-    def __init__(self, queue, counters, addr, dry_run=False, attempts=0, socket_timeout=2):
+    def __init__(self, in_queue, out_queue, counters, tasks_size=8192):
         super().__init__(daemon=True)
-        self._queue = queue
+        self.in_queue = in_queue
+        self.out_queue = out_queue
         self.counters = counters
-        self.addr = addr
-        self.dry_run = dry_run
         self.all = 0
         self.errors = 0
-        self.attempts = attempts
-        self.memc_client = memcache.Client((self.addr,), socket_timeout=socket_timeout)
+        self.tasks = {}
+        self.tasks_size = tasks_size
 
     def run(self):
 
         while True:
             try:
-                task = self._queue.get_nowait()
+                task = self.in_queue.get_nowait()
             except queue.Empty:
                 continue
+
             if task == SENTINEL:
                 self.counters.put((self.all, self.errors))
-                self._queue.task_done()
-                logging.info('{} - {}: total processed {} with errors {}'.format(
+                self.in_queue.task_done()
+                logging.info('Read statistics for {} - {}: total processed {}, errors {}'.format(
                     mp.current_process().name,
                     threading.current_thread().name,
                     self.all,
                     self.errors
                 ))
+                if self.tasks:
+                    self.out_queue.put(self.tasks)
+                self.out_queue.put(SENTINEL)
                 break
             else:
                 self.all += 1
@@ -59,45 +62,23 @@ class Worker(threading.Thread):
                 if not apps:
                     self.errors += 1
                     continue
-                if not self.insert_appsinstalled(apps):
-                    self.errors += 1
-                self._queue.task_done()
+                key, packed = self.serialize(apps)
+                self.tasks[key] = packed
 
-    def memc_write(self, key, packed):
-        counter = self.attempts if self.attempts > 0 else 1
-        result = False
+                if len(self.tasks) == self.tasks_size:
+                    self.out_queue.put(self.tasks)
+                    self.tasks.clear()
 
-        while counter:
-            if self.attempts > 0 and counter > 0:
-                counter -= 1
-            try:
-                result = self.memc_client.set(key, packed)
-            except Exception as err:
-                logging.exception(
-                    "An unexpected error occurred while writing to memc {}: {}".format(self.addr, err)
-                )
-                break
-            if result:
-                break
-            elif counter == 0:
-                result = False
-                logging.error("Cannot write to memc {}".format(self.addr))
-
-        return result
-
-    def insert_appsinstalled(self, appsinstalled):
+    def serialize(self, appsinstalled):
         ua = appsinstalled_pb2.UserApps()
         ua.lat = appsinstalled.lat
         ua.lon = appsinstalled.lon
         key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
         ua.apps.extend(appsinstalled.apps)
 
-        if self.dry_run:
-            logging.debug("{} - {} -> {}".format(self.addr, key, str(ua).replace("\n", " ")))
-        else:
-            packed = ua.SerializeToString()
-            return self.memc_write(key, packed)
-        return True
+        packed = ua.SerializeToString()
+
+        return key, packed
 
     def parse_appsinstalled(self, line):
         line_parts = line.strip().split("\t")
@@ -118,7 +99,97 @@ class Worker(threading.Thread):
         return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
-def put_to_queue(path, devices, _queue):
+class MemcWorker(threading.Thread):
+
+    def __init__(self, out_queue, counters, addr, dry=False, socket_timeout=2, attempts=0):
+        super().__init__()
+        self.out_queue = out_queue
+        self.counters = counters
+        self.addr = addr
+        self.attempts = attempts
+        self.dry = dry
+        self.all = 0
+        self.errors = 0
+        self.memc_client = memcache.Client((addr,), socket_timeout=socket_timeout)
+
+    def run(self):
+
+        while True:
+            try:
+                task = self.out_queue.get_nowait()
+            except queue.Empty:
+                continue
+
+            if task == SENTINEL or task is None:
+                self.counters.put((self.all, self.errors))
+                self.out_queue.task_done()
+                break
+            else:
+                self.all += 1
+                if self.dry:
+                    logging.debug("{} - {} -> {}".format(self.addr, *task))
+                elif not self.memc_write(task):
+                    self.errors += 1
+
+    def memc_write(self, task):
+        counter = self.attempts if self.attempts > 0 else 1
+        result = False
+
+        while counter:
+            if self.attempts > 0 and counter > 0:
+                counter -= 1
+            try:
+                result = self.memc_client.set_multi(task)
+            except Exception as err:
+                logging.exception(
+                    "An unexpected error occurred while writing to memc {}: {}".format(self.addr, err)
+                )
+                break
+            if not result:
+                break
+            elif counter == 0:
+                result = False
+                logging.error("Cannot write to memc {}".format(self.addr))
+
+        return result
+
+
+def start_workers_for_memc(queues, options):
+    dry = options.dry
+    socket_timeout = options.socket_timeout
+    attempts = options.attempts
+    workers = []
+    counters = queue.Queue()
+    for out_queue, addr in queues:
+        worker = MemcWorker(
+            out_queue, counters,
+            addr, dry, socket_timeout, attempts
+        )
+        workers.append(worker)
+
+    for worker in workers:
+        logging.info('Worker started in the thread {} of process {}.'.format(
+            threading.current_thread().name,
+            mp.current_process().name,
+        ))
+        worker.start()
+
+    for worker in workers:
+        worker.join()
+
+    _all = errors = 0
+    while not counters.empty():
+        result = counters.get()
+        _all += result[0]
+        errors += result[1]
+
+    if _all:
+        error_ratio = errors / _all
+        if error_ratio > ERROR_THRESHOLD:
+            logging.info("Many write errors occurred: {} > {}".format(error_ratio, ERROR_THRESHOLD))
+
+
+def put_to_queue(path, in_queue):
     _all = 0
     errors = 0
     logging.info('Process file {}'.format(path))
@@ -129,33 +200,31 @@ def put_to_queue(path, devices, _queue):
             line = line.strip()
             _all += 1
             dev_type = line.split(maxsplit=1)[0]
-            if dev_type not in devices:
+            if dev_type not in in_queue:
                 errors += 1
                 logging.error("Unknown device type: {}".format(dev_type))
                 continue
-            _queue[dev_type].put(line)
+            in_queue[dev_type].put(line)
 
     return collections.namedtuple('Counters', ('all', 'errors'))(_all, errors)
 
 
 def dispatcher(args):
-    path, devices, dry = args
+    path, in_queue, out_queue, task_size = args
     workers = []
-    _queue = {}
     counters = queue.Queue()
 
-    for dev_type, addr in devices.items():
-        _queue[dev_type] = queue.Queue()
-        worker = Worker(_queue[dev_type], counters, addr, dry)
+    for dev_type, in_q in in_queue.items():
+        worker = Worker(in_q, out_queue[dev_type], counters, task_size)
         workers.append(worker)
 
     for worker in workers:
         worker.start()
 
-    processed = put_to_queue(path, devices, _queue)
+    processed = put_to_queue(path, in_queue)
 
-    for dev_type in devices:
-        _queue[dev_type].put(SENTINEL)
+    for dev_type in in_queue:
+        in_queue[dev_type].put(SENTINEL)
 
     for worker in workers:
         worker.join()
@@ -169,7 +238,7 @@ def dispatcher(args):
     if processed.all or _all:
         error_ratio = processed.errors + errors / processed.all + _all
         if error_ratio > ERROR_THRESHOLD:
-            logging.info("Many errors occurred: {} > {}".format(error_ratio, ERROR_THRESHOLD))
+            logging.info("Many read errors occurred: {} > {}".format(error_ratio, ERROR_THRESHOLD))
 
     return path
 
@@ -177,7 +246,9 @@ def dispatcher(args):
 def dot_rename(path):
     head, fn = os.path.split(path)
     # atomic in most cases
-    os.rename(path, os.path.join(head, "." + fn))
+    to = os.path.join(head, "." + fn)
+    os.rename(path, to)
+    return to
 
 
 def main(options):
@@ -187,15 +258,41 @@ def main(options):
         "adid": options.adid,
         "dvid": options.dvid,
     }
-    args = []
-    for path in glob.iglob(options.pattern):
-        args.append((path, device_memc, options.dry))
-    args = sorted(args, key=lambda arg: arg[0])
 
+    thread_args = []
+    in_queue = {}
+    out_queue = {}
+    manager = mp.Manager()
+    for dev_type, addr in device_memc.items():
+        in_queue[dev_type] = manager.Queue()
+        out_queue[dev_type] = manager.Queue()
+
+        thread_args.append((out_queue[dev_type], addr, ))
+
+    proc_args = []
+    for path in glob.iglob(options.pattern):
+        proc_args.append((path, in_queue, out_queue, options.task_size))
+    proc_args = sorted(proc_args, key=lambda arg: arg[0])
+
+    if not proc_args:
+        logging.error(
+            'Nothing to upload. There is no match for the pattern {}.'.format(options.pattern)
+        )
+        return
+
+    # в отдельном процессе запускаются треды для записи
+    # в мемкеши соответсвующих устройств device_memc
+    mp.Process(
+        target=start_workers_for_memc,
+        args=(thread_args, options)
+    ).start()
+
+    # пул процессов, в каждом из которых запускаются
+    # len(device_memc) потоков
     proc_pool = mp.Pool(options.workers)
-    for path in proc_pool.imap(dispatcher, args):
-        dot_rename(path)
-        logging.info('File was renamed to {}'.format(path))
+    for path in proc_pool.imap(dispatcher, proc_args):
+        to = dot_rename(path)
+        logging.info('File {} was renamed to {}'.format(path, to))
 
 
 def prototest():
@@ -225,6 +322,9 @@ if __name__ == '__main__':
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     op.add_option("-w", "--workers", action="store", default=4, type="int")
+    op.add_option("-s", "--socket_timeout", action="store", default=2, type="int")
+    op.add_option("-a", "--attempts", action="store", default=0, type="int")
+    op.add_option("-T", "--task_size", action="store", default=8192, type="int")
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')

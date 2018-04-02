@@ -5,7 +5,7 @@ from optparse import OptionParser
 import memcache
 
 import appsinstalled_pb2
-from memc_load_conc import Worker, AppsInstalled
+from memc_load_conc import Worker, MemcWorker, AppsInstalled
 
 
 def cases(test_cases):
@@ -28,8 +28,9 @@ class WorkerTestCase(unittest.TestCase):
         (opts, args) = op.parse_args()
 
         counters = queue.Queue()
-        _queue = {'idfa': opts.idfa}
-        cls.worker = Worker(_queue, counters, opts.idfa, attempts=2)
+        in_queue = {'idfa': None}
+        out_queue = {'idfa': None}
+        cls.worker = Worker(in_queue, out_queue, counters)
 
     @cases((
             'idfa\te7e1a50c0ec2747ca56cd9e1558c0d7c\t67.7835424444\t-22.8044005471\t7942,8519,4232,3032,4766,9283,5682',
@@ -69,8 +70,8 @@ class MemcacheTestCase(unittest.TestCase):
         (opts, args) = op.parse_args()
 
         counters = queue.Queue()
-        _queue = {'idfa': opts.idfa}
-        cls.worker = Worker(_queue, counters, opts.idfa, attempts=2)
+        out_queue = {'idfa': None}
+        cls.worker = MemcWorker(out_queue, counters, opts.idfa, attempts=2)
 
         cls.client = memcache.Client((opts.idfa, ), socket_timeout=2, debug=1, dead_retry=3)
 
@@ -94,6 +95,6 @@ class MemcacheTestCase(unittest.TestCase):
         ua.apps.extend(appsinstalled.apps)
         packed = ua.SerializeToString()
 
-        self.worker.memc_write(key, packed)
+        self.worker.memc_write({key: packed})
 
         self.assertEqual(self.client.get(key), packed)
