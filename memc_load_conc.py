@@ -23,82 +23,6 @@ SENTINEL = bytes('quit_task', encoding='utf-8')
 ERROR_THRESHOLD = 0.01
 
 
-class Worker(threading.Thread):
-
-    def __init__(self, in_queue, out_queue, counters, tasks_size=8192):
-        super().__init__(daemon=True)
-        self.in_queue = in_queue
-        self.out_queue = out_queue
-        self.counters = counters
-        self.all = 0
-        self.errors = 0
-        self.tasks = {}
-        self.tasks_size = tasks_size
-
-    def run(self):
-
-        while True:
-            try:
-                task = self.in_queue.get_nowait()
-            except queue.Empty:
-                continue
-
-            if task == SENTINEL:
-                self.counters.put((self.all, self.errors))
-                self.in_queue.task_done()
-                logging.info('Read statistics for {} - {}: total processed {}, errors {}'.format(
-                    mp.current_process().name,
-                    threading.current_thread().name,
-                    self.all,
-                    self.errors
-                ))
-                if self.tasks:
-                    self.out_queue.put(self.tasks)
-                self.out_queue.put(SENTINEL)
-                break
-            else:
-                self.all += 1
-                apps = self.parse_appsinstalled(task)
-                if not apps:
-                    self.errors += 1
-                    continue
-                key, packed = self.serialize(apps)
-                self.tasks[key] = packed
-
-                if len(self.tasks) == self.tasks_size:
-                    self.out_queue.put(self.tasks)
-                    self.tasks.clear()
-
-    def serialize(self, appsinstalled):
-        ua = appsinstalled_pb2.UserApps()
-        ua.lat = appsinstalled.lat
-        ua.lon = appsinstalled.lon
-        key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
-        ua.apps.extend(appsinstalled.apps)
-
-        packed = ua.SerializeToString()
-
-        return key, packed
-
-    def parse_appsinstalled(self, line):
-        line_parts = line.strip().split("\t")
-        if len(line_parts) < 5:
-            return
-        dev_type, dev_id, lat, lon, raw_apps = line_parts
-        if not dev_type or not dev_id:
-            return
-        try:
-            apps = [int(a.strip()) for a in raw_apps.split(",")]
-        except ValueError:
-            apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
-            logging.info("Not all user apps are digits: `{}`".format(line))
-        try:
-            lat, lon = float(lat), float(lon)
-        except ValueError:
-            logging.info("Invalid geo coords: `{}`".format(line))
-        return AppsInstalled(dev_type, dev_id, lat, lon, apps)
-
-
 class MemcWorker(threading.Thread):
 
     def __init__(self, out_queue, counters, addr, dry=False, socket_timeout=2, attempts=0):
@@ -154,77 +78,106 @@ class MemcWorker(threading.Thread):
         return result
 
 
-def start_workers_for_memc(queues, options):
-    dry = options.dry
-    socket_timeout = options.socket_timeout
-    attempts = options.attempts
-    workers = []
-    counters = queue.Queue()
-    for out_queue, addr in queues:
-        worker = MemcWorker(
-            out_queue, counters,
-            addr, dry, socket_timeout, attempts
-        )
-        workers.append(worker)
+def serialize(appsinstalled):
+    ua = appsinstalled_pb2.UserApps()
+    ua.lat = appsinstalled.lat
+    ua.lon = appsinstalled.lon
+    key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
+    ua.apps.extend(appsinstalled.apps)
 
-    for worker in workers:
-        logging.info('Worker started in the thread {} of process {}.'.format(
-            threading.current_thread().name,
-            mp.current_process().name,
-        ))
-        worker.start()
+    packed = ua.SerializeToString()
 
-    for worker in workers:
-        worker.join()
-
-    _all = errors = 0
-    while not counters.empty():
-        result = counters.get()
-        _all += result[0]
-        errors += result[1]
-
-    if _all:
-        error_ratio = errors / _all
-        if error_ratio > ERROR_THRESHOLD:
-            logging.info("Many write errors occurred: {} > {}".format(error_ratio, ERROR_THRESHOLD))
+    return key, packed
 
 
-def put_to_queue(path, in_queue):
+def parse_appsinstalled(line):
+    line_parts = line.strip().split("\t")
+    if len(line_parts) < 5:
+        return
+    dev_type, dev_id, lat, lon, raw_apps = line_parts
+    if not dev_type or not dev_id:
+        return
+    try:
+        apps = [int(a.strip()) for a in raw_apps.split(",")]
+    except ValueError:
+        apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
+        logging.info("Not all user apps are digits: `{}`".format(line))
+    try:
+        lat, lon = float(lat), float(lon)
+    except ValueError:
+        logging.info("Invalid geo coords: `{}`".format(line))
+    return AppsInstalled(dev_type, dev_id, lat, lon, apps)
+
+
+def put_to_queue(path, output, tasks_size):
     _all = 0
     errors = 0
+    tasks = {}
     logging.info('Process file {}'.format(path))
+
     with gzip.open(path, mode="rt") as tracker_log:
+
         for line in tracker_log:
             if not line:
                 continue
             line = line.strip()
             _all += 1
             dev_type = line.split(maxsplit=1)[0]
-            if dev_type not in in_queue:
+            if dev_type not in output:
                 errors += 1
                 logging.error("Unknown device type: {}".format(dev_type))
                 continue
-            in_queue[dev_type].put(line)
+
+            apps = parse_appsinstalled(line)
+
+            if not apps:
+                errors += 1
+                continue
+            key, packed = serialize(apps)
+            tasks[key] = packed
+
+            if len(tasks) == tasks_size:
+                output[dev_type].put(tasks)
+                tasks = {}
 
     return collections.namedtuple('Counters', ('all', 'errors'))(_all, errors)
 
 
 def dispatcher(args):
-    path, in_queue, out_queue, task_size = args
+    path, options = args
+    device_memc = {
+        "idfa": options.idfa,
+        "gaid": options.gaid,
+        "adid": options.adid,
+        "dvid": options.dvid,
+    }
+    task_size = options.task_size
+    dry = options.dry
+    socket_timeout = options.socket_timeout
+    attempts = options.attempts
+
+    # создание и запуск тредов
+    # для соответствующих мемкешей устройств
     workers = []
     counters = queue.Queue()
+    output = {}
+    for dev_type, addr in device_memc.items():
+        output[dev_type] = queue.Queue()
 
-    for dev_type, in_q in in_queue.items():
-        worker = Worker(in_q, out_queue[dev_type], counters, task_size)
+        worker = MemcWorker(
+            output[dev_type], counters,
+            addr, dry, socket_timeout, attempts
+        )
         workers.append(worker)
 
     for worker in workers:
         worker.start()
 
-    processed = put_to_queue(path, in_queue)
+    # чтение из файла, парсинг, сериализация и отправка в очередь
+    processed = put_to_queue(path, output, task_size)
 
-    for dev_type in in_queue:
-        in_queue[dev_type].put(SENTINEL)
+    for dev_type in output:
+        output[dev_type].put(SENTINEL)
 
     for worker in workers:
         worker.join()
@@ -238,7 +191,7 @@ def dispatcher(args):
     if processed.all or _all:
         error_ratio = processed.errors + errors / processed.all + _all
         if error_ratio > ERROR_THRESHOLD:
-            logging.info("Many read errors occurred: {} > {}".format(error_ratio, ERROR_THRESHOLD))
+            logging.info("Many errors occurred: {} > {}".format(error_ratio, ERROR_THRESHOLD))
 
     return path
 
@@ -252,26 +205,9 @@ def dot_rename(path):
 
 
 def main(options):
-    device_memc = {
-        "idfa": options.idfa,
-        "gaid": options.gaid,
-        "adid": options.adid,
-        "dvid": options.dvid,
-    }
-
-    thread_args = []
-    in_queue = {}
-    out_queue = {}
-    manager = mp.Manager()
-    for dev_type, addr in device_memc.items():
-        in_queue[dev_type] = manager.Queue()
-        out_queue[dev_type] = manager.Queue()
-
-        thread_args.append((out_queue[dev_type], addr, ))
-
     proc_args = []
     for path in glob.iglob(options.pattern):
-        proc_args.append((path, in_queue, out_queue, options.task_size))
+        proc_args.append((path, options))
     proc_args = sorted(proc_args, key=lambda arg: arg[0])
 
     if not proc_args:
@@ -280,20 +216,12 @@ def main(options):
         )
         return
 
-    # в отдельном процессе запускаются треды для записи
-    # в мемкеши соответсвующих устройств device_memc
-    mp.Process(
-        target=start_workers_for_memc,
-        args=(thread_args, options)
-    ).start()
-
     # пул процессов, в каждом из которых запускаются
     # len(device_memc) потоков
     proc_pool = mp.Pool(options.workers)
     for path in proc_pool.imap(dispatcher, proc_args):
         to = dot_rename(path)
         logging.info('File {} was renamed to {}'.format(path, to))
-
 
 def prototest():
     sample = "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
