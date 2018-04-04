@@ -141,6 +141,10 @@ def put_to_queue(path, output, tasks_size):
             if len(devices_tasks[dev_type]) == tasks_size:
                 output[dev_type].put(devices_tasks[dev_type])
                 devices_tasks[dev_type] = {}
+                
+    for dev_type in devices_tasks:
+        if devices_tasks[dev_type]:
+            output[dev_type].put(devices_tasks[dev_type])
 
     return collections.namedtuple('Counters', ('all', 'errors'))(_all, errors)
 
