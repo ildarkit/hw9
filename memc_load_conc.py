@@ -112,7 +112,9 @@ def parse_appsinstalled(line):
 def put_to_queue(path, output, tasks_size):
     _all = 0
     errors = 0
-    tasks = {}
+    devices_tasks = {}
+    for key in output.keys():
+        devices_tasks[key] = {}
     logging.info('Process file {}'.format(path))
 
     with gzip.open(path, mode="rt") as tracker_log:
@@ -134,11 +136,11 @@ def put_to_queue(path, output, tasks_size):
                 errors += 1
                 continue
             key, packed = serialize(apps)
-            tasks[key] = packed
+            devices_tasks[dev_type][key] = packed
 
-            if len(tasks) == tasks_size:
-                output[dev_type].put(tasks)
-                tasks = {}
+            if len(devices_tasks[dev_type]) == tasks_size:
+                output[dev_type].put(devices_tasks[dev_type])
+                devices_tasks[dev_type] = {}
 
     return collections.namedtuple('Counters', ('all', 'errors'))(_all, errors)
 
